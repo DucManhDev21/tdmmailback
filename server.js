@@ -7,26 +7,25 @@ const fs = require('fs');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Cấu hình Multer để lưu file đính kèm tạm thời
+// Multer lưu tệp tạm
 const upload = multer({ dest: 'uploads/' });
 
-// Mở CORS cho Frontend Vercel
+// Mở CORS toàn bộ cho Frontend Vercel
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 
-// Hàm hỗ trợ Delay
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// API Kiểm tra trạng thái Server & Cấu hình Env
+// Health check API
 app.get('/api/health', (req, res) => {
   const senderEmail = process.env.SENDER_EMAIL;
   const appPassword = process.env.APP_PASSWORD;
 
   res.json({
     status: 'online',
-    system: 'Trần Đức Mạnh Bulk Email Engine',
+    system: 'Trần Đức Mạnh Email Engine',
     envConfigured: Boolean(senderEmail && appPassword),
-    senderEmail: senderEmail ? senderEmail : 'Chưa cấu hình SENDER_EMAIL trên Railway'
+    senderEmail: senderEmail ? senderEmail.trim() : 'Chưa cấu hình SENDER_EMAIL trên Railway'
   });
 });
 
@@ -35,7 +34,6 @@ app.post('/api/send-emails', upload.array('attachments'), async (req, res) => {
   const { recipients, subject, bodyType, content, repeatCount } = req.body;
   const files = req.files || [];
 
-  // Lấy Email gửi và Mật khẩu ứng dụng từ biến môi trường Railway
   const senderEmail = process.env.SENDER_EMAIL;
   const appPassword = process.env.APP_PASSWORD;
 
@@ -47,10 +45,9 @@ app.post('/api/send-emails', upload.array('attachments'), async (req, res) => {
   }
 
   if (!recipients || !subject || !content) {
-    return res.status(400).json({ success: false, message: 'Vui lòng điền đầy đủ các thông tin bắt buộc!' });
+    return res.status(400).json({ success: false, message: 'Vui lòng điền đầy đủ các thông tin!' });
   }
 
-  // Phân tách danh sách email nhận
   const recipientList = recipients
     .split(/[\n,]+/)
     .map((e) => e.trim())
@@ -60,25 +57,38 @@ app.post('/api/send-emails', upload.array('attachments'), async (req, res) => {
     return res.status(400).json({ success: false, message: 'Danh sách email nhận không hợp lệ!' });
   }
 
-  // Khởi tạo Transporter cho Nodemailer
+  // Cấu hình Nodemailer chuẩn chống CONNECTION TIMEOUT trên Railway
   const transporter = nodemailer.createTransport({
-    service: 'gmail',
+    host: 'smtp.gmail.com',
+    port: 587,
+    secure: false, // STARTTLS
     auth: {
       user: senderEmail.trim(),
-      pass: appPassword.replace(/\s+/g, ''), // Tự động xóa khoảng trắng nếu copy nhầm
+      pass: appPassword.replace(/\s+/g, ''), // Xóa khoảng trắng thừa
     },
+    connectionTimeout: 15000,
+    greetingTimeout: 10000,
+    socketTimeout: 20000,
+    tls: {
+      rejectUnauthorized: false
+    }
   });
 
-  // Chuẩn bị tệp đính kèm
   const attachments = files.map((file) => ({
     filename: file.originalname,
     path: file.path,
   }));
 
-  // Thiết lập SSE Headers
+  // Thiết lập SSE Headers chống NGINX/Vercel buffering
   res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+
+  // Gửi Ping Keep-Alive mỗi 3s giữ kết nối Vercel-Railway không bị timeout
+  const keepAliveInterval = setInterval(() => {
+    res.write(': keep-alive\n\n');
+  }, 3000);
 
   const totalSends = parseInt(repeatCount, 10) || 1;
   const totalTasks = totalSends * recipientList.length;
@@ -88,9 +98,10 @@ app.post('/api/send-emails', upload.array('attachments'), async (req, res) => {
 
   try {
     await transporter.verify();
-    res.write(`data: ${JSON.stringify({ type: 'info', message: `✅ Xác thực SMTP (${senderEmail}) thành công!` })}\n\n`);
+    res.write(`data: ${JSON.stringify({ type: 'info', message: `✅ Xác thực SMTP (${senderEmail.trim()}) thành công!` })}\n\n`);
   } catch (error) {
-    res.write(`data: ${JSON.stringify({ type: 'error', message: '❌ Kết nối Gmail thất bại! Hãy kiểm tra lại SENDER_EMAIL và APP_PASSWORD trên Railway.' })}\n\n`);
+    clearInterval(keepAliveInterval);
+    res.write(`data: ${JSON.stringify({ type: 'error', message: `❌ Kết nối Gmail thất bại: ${error.message}` })}\n\n`);
     attachments.forEach((f) => { if (fs.existsSync(f.path)) fs.unlinkSync(f.path); });
     return res.end();
   }
@@ -102,7 +113,7 @@ app.post('/api/send-emails', upload.array('attachments'), async (req, res) => {
       currentTaskIndex++;
 
       const mailOptions = {
-        from: `"Trần Đức Mạnh Mailer" <${senderEmail}>`,
+        from: `"Trần Đức Mạnh Mailer" <${senderEmail.trim()}>`,
         to: email,
         subject: subject,
         [bodyType === 'html' ? 'html' : 'text']: content,
@@ -132,7 +143,6 @@ app.post('/api/send-emails', upload.array('attachments'), async (req, res) => {
         );
       }
 
-      // Delay cố định 15s giữa các mail
       const isLast = cycle === totalSends && index === recipientList.length - 1;
       if (!isLast) {
         res.write(`data: ${JSON.stringify({ type: 'delay', seconds: 15 })}\n\n`);
@@ -141,7 +151,7 @@ app.post('/api/send-emails', upload.array('attachments'), async (req, res) => {
     }
   }
 
-  // Dọn dẹp file tạm
+  clearInterval(keepAliveInterval);
   attachments.forEach((f) => {
     if (fs.existsSync(f.path)) fs.unlinkSync(f.path);
   });
@@ -151,5 +161,5 @@ app.post('/api/send-emails', upload.array('attachments'), async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 TDM Email Backend running on port ${PORT}`);
+  console.log(`🚀 TDM Backend running on port ${PORT}`);
 });
